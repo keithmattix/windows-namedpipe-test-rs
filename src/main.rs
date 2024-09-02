@@ -71,85 +71,53 @@ impl WorkloadStreamProcessor {
         r.encode(&mut buf).unwrap();
 
         let iov = [IoSlice::new(&buf)];
-        self.client.writable().await?;
-        match self.client.try_write_vectored( &iov) {
-            Ok(n) => {
-                println!("Wrote {:?} bytes to pipe", n);
-                Ok(())
-            },
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                Ok(())
-            }
-            Err(e) => Err(e)
+        loop {
+            self.client.writable().await?;
+            match self.client.try_write_vectored( &iov) {
+                Ok(n) => {
+                    println!("Wrote {:?} bytes to pipe", n);
+                    return Ok(())
+                },
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    println!("Received WouldBlock error, retrying");
+                        continue;
+                }
+                Err(e) => return Err(e)
+            };
         }
-        // let handle = self.client.as_raw_handle(); // TODO: we're taking the raw handle of a borrowed value here, is this safe?
-        // // We're using ManuallyDrop to prevent the file from being closed on drop
-        // // This is because the file is our handle to the named pipe and it
-        // // needs to have the same lifetime as the client object
-        // let mut file = unsafe { std::mem::ManuallyDrop::new(File::from_raw_handle(handle)) };
-
-        // // async_io takes care of WouldBlock error, so no need for loop here
-        // self.client
-        //     .async_io(tokio::io::Interest::WRITABLE, || {
-        //         file.write_vectored(&iov) // TODO: May need to use syscalls directly, but we'll see if this works
-        //     })
-        //     .await
-        //     .map(|_| ())
     }
 
     pub async fn read_message(&self) -> anyhow::Result<Option<WorkloadMessage>> {
         // TODO: support messages for removing workload
-        let mut buffer = vec![0u8; 1024];
+        let mut buffer: Vec<u8> = vec![0u8; 1024];
         let mut iov = [IoSliceMut::new(&mut buffer)];
-        self.client.readable().await?;
-        match self.client.try_read_vectored(&mut iov) {
-            Ok(0) => {
-                println!("No data read from pipe");
-                Ok(None)
-            },
-            Ok(len) => get_workload_data(&buffer[..len]).map(Some),
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                Ok(None)
+
+        let len = {
+            loop {
+                println!("Waiting for pipe to be readable");
+                self.client.readable().await?;
+                // let read = Overlapped::new(cb)
+                let res = self.client.try_read_vectored(&mut iov);
+                let ok_res = match res {
+                    Ok(res) => {
+                        if res == 0 {
+                            println!("No data read from pipe. Probably a bug");
+                            return Ok(None);
+                        }
+                        res
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        println!("Received WouldBlock error, retrying");
+                        continue;
+                    }
+                    Err(e) => {
+                        return Err(e.into());
+                    }
+                };
+                break ok_res;
             }
-            Err(e) => Err(e.into())
-        }
-        //  let len = {
-        //      loop {
-        //         tokio::select! {
-        //             biased;
-        //             res = self.client.readable() => res,
-        //         }?;
-        //         let handle = self.client.as_raw_handle(); // TODO: we're taking the raw handle of a borrowed value here, is this safe?
-        //         // We're using ManuallyDrop to prevent the file from being closed on drop
-        //         // This is because the file is our handle to the named pipe and it
-        //         // needs to have the same lifetime as the client object
-        //         let mut file = unsafe { std::mem::ManuallyDrop::new(File::from_raw_handle(handle)) };
-        //         let res = self.client.try_io(tokio::io::Interest::READABLE, || {
-        //              println!("About to read from pipe. File: {:?}", file);
-        //              let res = file.read_vectored(&mut iov);
-        //              println!("Read {:?} bytes from pipe", res);
-        //              res
-        //          });
-        //          let ok_res = match res {
-        //              Ok(res) => {
-        //                  if res == 0 {
-        //                      return Ok(None);
-        //                  }
-        //                  res
-        //              }
-        //              Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-        //                  continue;
-        //              }
-        //              Err(e) => {
-        //                  return Err(e.into());
-        //              }
-        //          };
-        //          break ok_res;
-        //      }
-        //  };
-
-        //  get_workload_data(&buffer[..len]).map(Some)
-
+        };
+        get_workload_data(&buffer[..len]).map(Some)
     }
 }
 
